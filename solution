@@ -1,0 +1,181 @@
+-- Step 1: Database Schema
+CREATE TABLE customers (
+    customer_id SERIAL PRIMARY KEY,
+    name TEXT,
+    email TEXT,
+    phone TEXT,
+    address TEXT
+);
+
+CREATE TABLE agents (
+    agent_id SERIAL PRIMARY KEY,
+    name TEXT,
+    email TEXT,
+    phone TEXT
+);
+
+CREATE TABLE policies (
+    policy_id SERIAL PRIMARY KEY,
+    policy_type TEXT,
+    coverage_amount NUMERIC,
+    premium_amount NUMERIC,
+    start_date DATE,
+    end_date DATE,
+    customer_id INT REFERENCES customers(customer_id),
+    agent_id INT REFERENCES agents(agent_id),
+    approved_by TEXT
+);
+
+CREATE TABLE claims (
+    claim_id SERIAL PRIMARY KEY,
+    policy_id INT REFERENCES policies(policy_id),
+    claim_amount NUMERIC,
+    claim_date DATE,
+    claim_status TEXT,
+    incident_description TEXT
+);
+
+CREATE TABLE payments (
+    payment_id SERIAL PRIMARY KEY,
+    policy_id INT REFERENCES policies(policy_id),
+    customer_id INT REFERENCES customers(customer_id),
+    payment_date DATE,
+    amount NUMERIC,
+    payment_method TEXT
+);
+
+-- Step 3.2: Automated Claim Status Updates
+CREATE OR REPLACE FUNCTION update_claim_status()
+RETURNS TRIGGER AS $$
+BEGIN
+    IF NEW.claim_amount < 10000 THEN
+        NEW.claim_status := 'Approved';
+    ELSE
+        NEW.claim_status := 'Pending';
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_update_claim_status
+BEFORE INSERT ON claims
+FOR EACH ROW
+EXECUTE FUNCTION update_claim_status();
+
+-- Step 3.3: Reports
+-- Policies by Agent
+SELECT agent_id, COUNT(*) AS total_policies
+FROM policies
+GROUP BY agent_id;
+
+-- Claims by Status
+SELECT claim_status, COUNT(*) AS total_claims
+FROM claims
+GROUP BY claim_status;
+
+-- Payment history per customer and policy
+SELECT customer_id, policy_id, SUM(amount) AS total_paid
+FROM payments
+GROUP BY customer_id, policy_id;
+
+-- Step 4.1: Auto-expiring policies
+CREATE OR REPLACE FUNCTION expire_policies()
+RETURNS TRIGGER AS $$
+BEGIN
+    IF NEW.end_date < CURRENT_DATE THEN
+        NEW.approved_by := 'Expired';
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_expire_policies
+BEFORE UPDATE ON policies
+FOR EACH ROW
+EXECUTE FUNCTION expire_policies();
+
+-- Step 4.2: Prevent Duplicate Claims
+CREATE UNIQUE INDEX unique_claim_incident ON claims(policy_id, incident_description);
+
+-- Step 4.3: Auto-calculate agent commissions
+ALTER TABLE agents ADD COLUMN commission NUMERIC DEFAULT 0;
+
+CREATE OR REPLACE FUNCTION update_agent_commission()
+RETURNS TRIGGER AS $$
+BEGIN
+    UPDATE agents
+    SET commission = commission + (NEW.premium_amount * 0.10)
+    WHERE agent_id = NEW.agent_id;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_commission_update
+AFTER INSERT ON policies
+FOR EACH ROW
+EXECUTE FUNCTION update_agent_commission();
+
+-- Step 4.4: Auto-approve low claims (already done above)
+
+-- Step 4 Stored Procedures
+-- Policy Renewal
+CREATE OR REPLACE PROCEDURE renew_policies()
+LANGUAGE plpgsql AS $$
+BEGIN
+    INSERT INTO policies (policy_type, coverage_amount, premium_amount, start_date, end_date, customer_id, agent_id, approved_by)
+    SELECT policy_type, coverage_amount, premium_amount, CURRENT_DATE,
+           CURRENT_DATE + INTERVAL '1 year', customer_id, agent_id, 'Auto-Renewed'
+    FROM policies p
+    WHERE p.end_date <= CURRENT_DATE
+      AND NOT EXISTS (
+            SELECT 1 FROM claims c
+            WHERE c.policy_id = p.policy_id AND c.claim_status != 'Approved'
+      )
+      AND (
+            SELECT SUM(amount) FROM payments WHERE policy_id = p.policy_id
+      ) >= p.premium_amount;
+END;
+$$;
+
+-- Automate Recurring Payments
+CREATE OR REPLACE PROCEDURE process_recurring_payments()
+LANGUAGE plpgsql AS $$
+BEGIN
+    INSERT INTO payments (policy_id, customer_id, payment_date, amount, payment_method)
+    SELECT p.policy_id, p.customer_id, CURRENT_DATE, p.premium_amount, 'Auto-Debit'
+    FROM policies p;
+END;
+$$;
+
+-- Generate Daily Reports
+CREATE OR REPLACE PROCEDURE generate_daily_report()
+LANGUAGE plpgsql AS $$
+BEGIN
+    RAISE NOTICE 'Policies: %', (SELECT COUNT(*) FROM policies WHERE start_date = CURRENT_DATE);
+    RAISE NOTICE 'Claims: %', (SELECT COUNT(*) FROM claims WHERE claim_date = CURRENT_DATE);
+    RAISE NOTICE 'Payments: %', (SELECT COUNT(*) FROM payments WHERE payment_date = CURRENT_DATE);
+END;
+$$;
+
+-- Audit Tables
+CREATE TABLE audit_policies (
+    id SERIAL PRIMARY KEY,
+    operation TEXT,
+    policy_id INT,
+    changed_by TEXT,
+    changed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE OR REPLACE FUNCTION log_policy_changes()
+RETURNS TRIGGER AS $$
+BEGIN
+    INSERT INTO audit_policies(operation, policy_id, changed_by)
+    VALUES (TG_OP, NEW.policy_id, CURRENT_USER);
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_audit_policies
+AFTER INSERT OR UPDATE OR DELETE ON policies
+FOR EACH ROW
+EXECUTE FUNCTION log_policy_changes();
